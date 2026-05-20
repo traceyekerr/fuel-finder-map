@@ -12,6 +12,69 @@ const path    = require('path');
 const https   = require('https');
 const http    = require('http');
 
+// ── Brevo email API ──────────────────────────────────────────
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+if (BREVO_API_KEY) console.log('📧  Brevo email ready');
+else console.log('📧  No BREVO_API_KEY — contact form submissions will be logged to console only.');
+
+function brevoSend(to, replyTo, subject, text) {
+  const body = JSON.stringify({
+    sender:      { name: 'Fuel Finder Map UK', email: process.env.BREVO_SENDER_EMAIL || to },
+    to:          [{ email: to }],
+    replyTo:     { email: replyTo },
+    subject,
+    textContent: text,
+  });
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'api.brevo.com',
+      path:     '/v3/smtp/email',
+      method:   'POST',
+      headers:  {
+        'api-key':        BREVO_API_KEY,
+        'Content-Type':   'application/json',
+        'Accept':         'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, res => {
+      let raw = '';
+      res.on('data', d => raw += d);
+      res.on('end', () => {
+        if (res.statusCode >= 400) reject(new Error(`Brevo ${res.statusCode}: ${raw.slice(0, 200)}`));
+        else resolve();
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function brevoKeepAlive() {
+  if (!BREVO_API_KEY) return;
+  const req = https.request({
+    hostname: 'api.brevo.com',
+    path:     '/v3/account',
+    method:   'GET',
+    headers:  { 'api-key': BREVO_API_KEY, 'Accept': 'application/json' },
+  }, res => console.log(`📧  Brevo keep-alive ping: ${res.statusCode}`));
+  req.on('error', err => console.error('📧  Brevo keep-alive error:', err.message));
+  req.end();
+}
+brevoKeepAlive();
+setInterval(brevoKeepAlive, 7 * 24 * 60 * 60 * 1000);
+
+// ── Contact form rate limiter ────────────────────────────────
+const contactRateMap = new Map();
+function isRateLimited(ip) {
+  const now   = Date.now();
+  const entry = contactRateMap.get(ip) || { count: 0, resetAt: now + 3_600_000 };
+  if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + 3_600_000; }
+  entry.count++;
+  contactRateMap.set(ip, entry);
+  return entry.count > 5;
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -338,6 +401,8 @@ function mergeStationsWithPrices(stations, priceRecords) {
 }
 
 // ── Routes ──────────────────────────────────────────────────
+app.use(express.json());
+
 // No-cache headers so browser always picks up latest HTML/JS
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders: (res) => {
@@ -409,6 +474,51 @@ app.get('/api/status', (req, res) => {
     counts:         cachedData?.counts,
     urls: { token: TOKEN_URL, pfs: PFS_URL, prices: PRICES_URL },
   });
+});
+
+app.post('/api/contact', async (req, res) => {
+  try {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+    if (isRateLimited(ip)) {
+      return res.status(429).json({ error: 'Too many submissions — please try again later.' });
+    }
+
+    const { name, email, message, honeypot } = req.body || {};
+
+    if (honeypot) return res.json({ ok: true });
+
+    if (!name?.trim() || !email?.trim() || !message?.trim()) {
+      return res.status(400).json({ error: 'Please fill in all fields.' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (message.length > 2000) {
+      return res.status(400).json({ error: 'Message must be under 2000 characters.' });
+    }
+
+    const subject = `Fuel Finder Map UK contact: ${name.trim()}`;
+    const body    = `Name:    ${name.trim()}\nEmail:   ${email.trim()}\n\n${message.trim()}`;
+
+    if (BREVO_API_KEY) {
+      await brevoSend(
+        process.env.CONTACT_EMAIL_TO || process.env.BREVO_SENDER_EMAIL,
+        email.trim(),
+        subject,
+        body
+      );
+    } else {
+      console.log(`\n[Contact form]\n${body}\n`);
+    }
+
+    res.json({ ok: true });
+
+  } catch (err) {
+    console.error('Contact form error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Could not send your message — please try again later.' });
+    }
+  }
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
